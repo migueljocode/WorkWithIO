@@ -1,0 +1,11 @@
+﻿global using static PDF_To_PNG.StaticMethods;
+global using Syncfusion.PdfToImageConverter;
+global using static System.Console;
+global using static System.Convert;
+global using System.Threading.Tasks;
+global using static System.String;
+global using static System.IO.File;
+global using static System.IO.Directory;
+global using static System.IO.Path;
+global using Syncfusion.Drawing;
+global using static System.IO.FileMode;
