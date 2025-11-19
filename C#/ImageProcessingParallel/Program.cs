@@ -26,6 +26,7 @@ ParallelOptions options = new ParallelOptions { MaxDegreeOfParallelism = Environ
 int _cpuCores = Environment.ProcessorCount;
 int _filesCount = default;
 int _completedFiles = 1;
+string[] _supportedFormats = [ ".jpg", ".jpeg", ".png", ".cr2", ".dng", ".heic", ".heif" ];
 
 Clear();
 
@@ -67,7 +68,7 @@ try
 
     
     files = GetFiles(inputFolder, "*.*")
-            .Where(file => new[] { ".jpg", ".jpeg", ".png", ".cr2", ".dng" }.Contains(GetExtension(file).ToLower()))
+            .Where(file => _supportedFormats.Contains(GetExtension(file).ToLower()))
             .ToArray();
     
     _filesCount = files.Length;
@@ -134,7 +135,7 @@ async Task<bool> CompressImageAsync(string file, string outputPath, uint quality
                 image.Quality = quality; // Compression quality  
 
                 // Convert RAW formats to JPEG if applicable
-                if (image.Format == MagickFormat.Cr2 || image.Format == MagickFormat.Dng)
+                if (image.Format == MagickFormat.Cr2 || image.Format == MagickFormat.Dng || image.Format == MagickFormat.Heic || image.Format == MagickFormat.Heif)
                     image.Format = MagickFormat.Jpeg;
 
                 image.Write(outputPath);

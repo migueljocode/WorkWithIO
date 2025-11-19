@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/MyRemoveDuplicatedWords/">
+    <Project Path="MyRemoveDuplicatedWords/RemoveDuplicatedWords.csproj" />
+  </Folder>
+  <Folder Name="/SortFilesAccordingToLastWriteTimeInPersianCalenderShamsi_dotnet10/">
+    <Project Path="SortFilesAccordingToLastWriteTimeInPersianCalenderShamsi_dotnet10/SortFileAccordingToPersinaCallendarUsingDotNet10.csproj" />
+  </Folder>
+  <Project Path="DeleteDuplicatedFilesConsole/DeleteDuplicatedFilesConsole.csproj" />
+  <Project Path="ExtractContacts/ExtractContacts.csproj" />
+  <Project Path="ExtractHTML/ExtractHTML.csproj" />
+  <Project Path="FormatChanger/FormatChanger.csproj" />
+  <Project Path="ImageProcessingParallel/ImageProcessingParallel.csproj" />
+  <Project Path="OrganizeText/OrganizeText.csproj" />
+</Solution>
