@@ -237,7 +237,8 @@ If you add a new project, add a short README to the project folder and link it f
 ## License & author
 
 - Author: [migueljocode](https://github.com/migueljocode)  
-- License: No license file present in the repository root. If you are the repo owner and want a license, add a `LICENSE` file. Until a license is added, use is governed by the repository owner's terms.
+- License: No license file present in the repository root.
+- Until a license is added, use is governed by the repository owner's terms.
 
 ---
 
@@ -249,9 +250,4 @@ https://github.com/migueljocode/WorkWithIO/issues
 ---
 
 Notes and next steps
-- Many C# folders may contain `Program.cs` and a project file — inspect each folder for specific command-line options and per-project READMEs.  
-- If you want, I can:
-  - generate or expand per-project README.md files (I can draft README files for each C# project based on the code), or
-  - create a LICENSE file and contributing templates, or
-  - produce usage examples / CLI argument docs for each C# program (requires me to read each `Program.cs`).
-Please tell me which next step you prefer.
+- Many C# folders may contain `Program.cs` and a project file — inspect each folder for specific command-line options and per-project READMEs.
