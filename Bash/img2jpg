@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# img2jpg — convert RAW and standard images to compressed JPEG
+# Supports directory mode and direct file arguments.
+# RAW decoding via dcraw; standard images via ImageMagick.
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_QUALITY=92
+DEFAULT_HIGHLIGHT=4
+DEFAULT_BRIGHTNESS=1.6
+COMPRESSED_SUBDIR="compressed"
+
+# ── RAW extensions handled by dcraw ───────────────────────────────────────────
+# Covers Canon, Nikon, Sony, Fuji, Olympus, Panasonic, Pentax, Leica,
+# Samsung, Mamiya, Hasselblad, Sigma, Adobe DNG, and generic raw formats.
+RAW_EXTS="cr2 cr3 dng nef nrw arw srf sr2 raf orf rw2 pef srw
+           mos 3fr mef mrw x3f rwl iiq dcr kdc erf"
+
+# ── Standard (non-RAW) extensions handled by ImageMagick ──────────────────────
+# Raster: common + high-depth + legacy
+# JPEG 2000: jp2 j2k j2c jpf jpx jpm mj2
+# HEIF/AVIF: heic heif avif avifs          (requires libheif delegate)
+# Web/modern: webp jxl                     (jxl requires libjxl delegate)
+# Photoshop: psd psb
+# GIMP/paint: xcf xpm xbm
+# Document raster: pcx tga sgi pnm pgm pbm ppm pam
+# HDR/scientific: hdr exr                  (exr requires OpenEXR delegate)
+# Misc: ico cur wbmp
+STD_EXTS="jpg jpeg png tiff tif webp bmp
+          jp2 j2k j2c jpf jpx jpm mj2
+          heic heif avif avifs
+          jxl
+          psd psb
+          xcf xpm xbm
+          pcx tga sgi pnm pgm pbm ppm pam
+          hdr exr
+          ico cur wbmp"
+
+# ══════════════════════════════════════════════════════════════════════════════
+usage() {
+    cat <<EOF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  img2jpg — batch image → JPEG converter
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+USAGE
+  img2jpg [OPTIONS] [FILE ...]          # convert specific files
+  img2jpg [OPTIONS] -i <dir>            # convert all images in a directory
+  img2jpg [OPTIONS]                     # convert current directory
+
+OPTIONS
+  -i <dir>    Input directory
+              (default: current directory, ignored if files are passed directly)
+
+  -o <dir>    Output directory
+              (default: <input_dir>/compressed, or ./compressed for file mode)
+
+  -q <1-100>  JPEG quality
+              (default: $DEFAULT_QUALITY)
+
+  -t          Do NOT preserve original file modification/access times
+              (default: ON — pass -t to toggle off)
+
+  -H <0-9>    RAW highlight recovery level (dcraw -H)
+                0 = clip highlights (fastest)
+                2 = blend clipped/unclipped
+                3 = reconstruct highlights
+                4 = more aggressive reconstruction (default)
+              5-9 = increasingly aggressive recovery
+              (default: $DEFAULT_HIGHLIGHT)
+
+  -W          Use camera white balance for RAW files
+              (default: ON — pass -W to toggle off)
+
+  -b <num>    RAW brightness multiplier  ⚠️  RAW files only
+                < 1.0 = darker   (e.g. 0.7)
+                  1.0 = no change
+                > 1.0 = brighter (e.g. 1.5, 2.0)
+              Applied by dcraw at decode time (pre-gamma, best quality).
+              (default: $DEFAULT_BRIGHTNESS)
+
+  -A          RAW auto-level  ⚠️  RAW files only
+              Stretches each channel's histogram to full 0–255 range.
+              (default: ON — pass -A to toggle off)
+
+  -h          Show this help
+
+SUPPORTED FORMATS
+  RAW    CR2 CR3 DNG NEF NRW ARW SRF SR2 RAF ORF RW2 PEF SRW
+         MOS 3FR MEF MRW X3F RWL IIQ DCR KDC ERF
+         (Canon, Nikon, Sony, Fuji, Olympus, Panasonic, Pentax,
+          Leica, Samsung, Mamiya, Hasselblad, Sigma, Adobe DNG…)
+
+  STD    JPG JPEG PNG TIFF TIF BMP WEBP
+         JP2 J2K J2C JPF JPX JPM MJ2       (JPEG 2000)
+         HEIC HEIF AVIF AVIFS               (HEIF/AVIF — needs libheif)
+         JXL                                (JPEG XL — needs libjxl)
+         PSD PSB                            (Photoshop)
+         XCF XPM XBM                        (GIMP / X11)
+         PCX TGA SGI PNM PGM PBM PPM PAM   (legacy raster)
+         HDR EXR                            (HDR / OpenEXR — needs libopenexr)
+         ICO CUR WBMP                       (icons / mobile)
+
+EXAMPLES
+  # Convert current directory, default settings
+  img2jpg
+
+  # Convert specific mixed files
+  img2jpg shot.cr3 preview.jpg scan.png scan.jp2
+
+  # Convert and disable timestamp preservation
+  img2jpg -i ./photos -t
+
+  # Combine RAW brightness + auto-level + high quality
+  img2jpg -b 1.3 -A -q 95
+
+NOTES
+  • Output filenames always use lowercase .jpg extension.
+  • OS Dates & EXIF/IPTC/XMP metadata are preserved from the source file.
+  • Files already inside the output directory are skipped automatically.
+  • All extension matching is case-insensitive (cr2 = CR2 = Cr2).
+
+DEPENDENCIES
+  dcraw                  sudo apt install dcraw
+  imagemagick (magick)   sudo apt install imagemagick
+  exiftool               sudo apt install libimage-exiftool-perl
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+    exit 0
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+input_dir=""
+output_dir=""
+quality="$DEFAULT_QUALITY"
+highlight="$DEFAULT_HIGHLIGHT"
+brightness="$DEFAULT_BRIGHTNESS"
+auto_level=1
+use_camera_wb=1
+preserve_times=1
+
+while getopts "i:o:q:H:Wb:Aht" opt; do
+    case "$opt" in
+        i) input_dir="$OPTARG" ;;
+        o) output_dir="$OPTARG" ;;
+        q) quality="$OPTARG" ;;
+        H) highlight="$OPTARG" ;;
+        W) use_camera_wb=0 ;;  # default ON; pass -W to disable
+        b) brightness="$OPTARG" ;;
+        A) auto_level=0 ;;     # default ON; pass -A to disable
+        t) preserve_times=0 ;; # default ON; pass -t to disable
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+# Remaining positional args are direct file paths
+direct_files=("$@")
+
+# ── Validation ────────────────────────────────────────────────────────────────
+if ! [[ "$quality" =~ ^[0-9]+$ ]] || (( quality < 1 || quality > 100 )); then
+    echo "❌ Quality must be 1–100."; exit 1
+fi
+if ! [[ "$highlight" =~ ^[0-9]+$ ]] || (( highlight < 0 || highlight > 9 )); then
+    echo "❌ Highlight level must be 0–9."; exit 1
+fi
+if ! [[ "$brightness" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+   || [ "$(echo "$brightness <= 0" | bc -l)" -eq 1 ]; then
+    echo "❌ Brightness must be a positive number (e.g. 0.7, 1.0, 1.5)."; exit 1
+fi
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+missing=()
+command -v dcraw    &>/dev/null || missing+=("dcraw")
+command -v magick   &>/dev/null || missing+=("imagemagick")
+command -v exiftool &>/dev/null || missing+=("libimage-exiftool-perl")
+if (( ${#missing[@]} > 0 )); then
+    echo "❌ Missing: ${missing[*]}"
+    echo "   Install : sudo apt install ${missing[*]}"
+    exit 1
+fi
+
+# ── Resolve input source & output dir ─────────────────────────────────────────
+if (( ${#direct_files[@]} > 0 )); then
+    # File mode: -i is ignored
+    mode="files"
+    [ -z "$output_dir" ] && output_dir="./compressed"
+else
+    # Directory mode
+    mode="dir"
+    [ -z "$input_dir" ] && input_dir="."
+    if [ ! -d "$input_dir" ]; then
+        echo "❌ Input directory '$input_dir' does not exist."; exit 1
+    fi
+    [ -z "$output_dir" ] && output_dir="$input_dir/$COMPRESSED_SUBDIR"
+fi
+
+mkdir -p "$output_dir" || { echo "❌ Cannot create output directory '$output_dir'"; exit 1; }
+
+# ── Helper: is a file a RAW format? ───────────────────────────────────────────
+is_raw() {
+    local ext="${1##*.}"
+    ext="${ext,,}"   # lowercase
+    for r in $RAW_EXTS; do
+        [ "$ext" = "$r" ] && return 0
+    done
+    return 1
+}
+
+is_std() {
+    local ext="${1##*.}"
+    ext="${ext,,}"
+    for s in $STD_EXTS; do
+        [ "$ext" = "$s" ] && return 0
+    done
+    return 1
+}
+
+# ── Print header ──────────────────────────────────────────────────────────────
+if magick --version 2>/dev/null | grep -q "HDRI"; then
+    echo "✅ ImageMagick HDRI build detected."
+else
+    echo "⚠️  ImageMagick non-HDRI build (install imagemagick-7.q16hdri for best RAW quality)."
+fi
+
+if [ "$mode" = "dir" ]; then
+    echo "📂 Input : $input_dir"
+else
+    echo "📄 Files : ${#direct_files[@]} file(s) passed directly"
+fi
+echo "📂 Output: $output_dir"
+
+brightness_label="$brightness"x
+[ "$brightness" = "1.0" ] || [ "$brightness" = "1" ] && brightness_label="off"
+al_label=$([ $auto_level -eq 1 ] && echo "on" || echo "off")
+wb_label=$([ $use_camera_wb -eq 1 ] && echo "camera" || echo "auto")
+time_label=$([ $preserve_times -eq 1 ] && echo "on" || echo "off")
+
+echo "⚙️  quality=${quality}  highlight=${highlight}  wb=${wb_label}  timesync=${time_label}  [RAW only] brightness=${brightness_label}  auto-level=${al_label}"
+echo "──────────────────────────────────────────────────────"
+
+raw_ok=0; raw_fail=0
+std_ok=0; std_fail=0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAW processing
+# ══════════════════════════════════════════════════════════════════════════════
+process_raw() {
+    local f="$1"
+    local base; base=$(basename "$f")
+    local name="${base%.*}"
+    local out="$output_dir/${name}.jpg"
+
+    echo "📷 RAW  │ $base"
+
+    local dcraw_args=("-c" "-H" "$highlight" "-6" "-g" "2.4" "12.92" "-b" "$brightness")
+    [ $use_camera_wb -eq 1 ] && dcraw_args+=("-w")
+
+    local magick_args=()
+    [ $auto_level -eq 1 ] && magick_args+=("-auto-level")
+
+    if dcraw "${dcraw_args[@]}" "$f" 2>/dev/null \
+        | magick - "${magick_args[@]}" -depth 16 -quality "$quality" jpg:"$out" 2>/dev/null; then
+        exiftool -q -overwrite_original -P \
+            -tagsFromFile "$f" -all:all -Orientation=1 -n "$out" 2>/dev/null
+        
+        # Sync OS-level modification/access dates from original file
+        [ $preserve_times -eq 1 ] && touch -r "$f" "$out"
+        
+        echo "        ✅ → $(basename "$out")"
+        (( raw_ok++ ))
+    else
+        echo "        ❌ Conversion failed"
+        (( raw_fail++ ))
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Standard image processing
+# ══════════════════════════════════════════════════════════════════════════════
+process_standard() {
+    local f="$1"
+    local base; base=$(basename "$f")
+    local name="${base%.*}"
+    local out="$output_dir/${name}.jpg"
+
+    # Skip if source and output resolve to the same path
+    if [ "$(realpath "$f")" = "$(realpath "$out" 2>/dev/null)" ]; then
+        echo "⏭  STD   │ $base  (skipped — same as output)"
+        return
+    fi
+    # Skip if source lives inside the output dir
+    [[ "$(realpath "$f")" == "$(realpath "$output_dir")"/* ]] && return
+
+    echo "🖼  STD   │ $base"
+
+    if magick "$f" \
+        -auto-orient \
+        -strip \
+        -interlace Plane \
+        -colorspace sRGB \
+        -quality "$quality" \
+        jpg:"$out" 2>/dev/null; then
+        exiftool -q -overwrite_original -P \
+            -tagsFromFile "$f" -EXIF:all -IPTC:all -XMP:all \
+            -Orientation=1 -n "$out" 2>/dev/null
+        
+        # Sync OS-level modification/access dates from original file
+        [ $preserve_times -eq 1 ] && touch -r "$f" "$out"
+        
+        echo "        ✅ → $(basename "$out")"
+        (( std_ok++ ))
+    else
+        echo "        ❌ Conversion failed"
+        (( std_fail++ ))
+    fi
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+dispatch() {
+    local f="$1"
+    if   is_raw "$f"; then process_raw      "$f"
+    elif is_std "$f"; then process_standard "$f"
+    else
+        echo "⚠️  SKIP  │ $(basename "$f")  (unsupported extension)"
+    fi
+}
+
+if [ "$mode" = "files" ]; then
+    for f in "${direct_files[@]}"; do
+        if [ ! -f "$f" ]; then
+            echo "❌ File not found: $f"; continue
+        fi
+        dispatch "$f"
+    done
+else
+    shopt -s nullglob nocaseglob
+    all_exts=($RAW_EXTS $STD_EXTS)
+    shopt -u nullglob nocaseglob
+
+    found=0
+    for ext in "${all_exts[@]}"; do
+        shopt -s nullglob nocaseglob
+        files=( "$input_dir"/*."$ext" )
+        shopt -u nullglob nocaseglob
+        for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            # Skip output subdir contents
+            [[ "$(realpath "$f")" == "$(realpath "$output_dir")"/* ]] && continue
+            dispatch "$f"
+            (( found++ ))
+        done
+    done
+
+    if (( found == 0 )); then
+        echo "❌ No supported image files found in '$input_dir'"
+        exit 1
+    fi
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+total_ok=$(( raw_ok + std_ok ))
+total_fail=$(( raw_fail + std_fail ))
+total=$(( total_ok + total_fail ))
+
+echo "──────────────────────────────────────────────────────"
+if (( total == 0 )); then
+    echo "❌ No files were processed."; exit 1
+fi
+
+echo "✅ Done.  $total_ok / $total converted successfully."
+(( raw_ok + raw_fail > 0 )) && echo "   📷 RAW      : ${raw_ok} ok  ${raw_fail} failed"
+(( std_ok + std_fail > 0 )) && echo "   🖼  Standard : ${std_ok} ok  ${std_fail} failed"
+(( total_fail > 0 )) && exit 1 || exit 0
