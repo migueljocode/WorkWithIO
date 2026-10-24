@@ -6,7 +6,7 @@
 .DESCRIPTION
     URLs come from the clipboard, the command line or list files; unfinished downloads are saved so they can be resumed.
     Missing prerequisites are installed only when needed (winget / choco / scoop / Homebrew / apt / dnf / pacman).
-    Run  ./dneat.ps1 -Help  for every option.  Defaults match dneat 1.0.0 (bash / zsh).
+    Run  ./dneat.ps1 -Help  for every option.  Defaults match dneat 1.1.0 (bash / zsh).
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -28,9 +28,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:DneatVersion = '1.0.0'
+$script:DneatVersion = '1.1.0'
 $script:DefaultSession = 'resume.session'
-$script:UrlRe = '(?:https?|ftps?)://\S+'                    # what is picked out of clipboard text
+$script:UrlRe = '(?:(?:https?|ftps?|sftp)://|magnet:\?)\S+'   # what is picked out of clipboard text
+$script:TickMs = 500                                          # live progress refresh interval
 $script:ItemRe = '^(?:(?:https?|ftps?|sftp)://|magnet:)'    # a URL line in an aria2 input file (options are indented)
 $script:Self = './dneat.ps1'
 $script:StartedAt = [Diagnostics.Stopwatch]::StartNew()
@@ -83,22 +84,13 @@ function Format-Bytes([double] $B) {
 }
 
 # aria2 prints sizes as 1.4MiB / 512KiB / 0B; the UI uses the same KB/MB style as vneat and pneat.
-function ConvertTo-SpeedLabel([string] $S) { if ($S -match '^([\d.]+)([KMGT]?)i?B$') { "$($Matches[1]) $($Matches[2])B/s" } else { "$S/s" } }
-function ConvertTo-Seconds([string] $Eta) {       # 1h2m3s -> seconds
-    $t = 0
-    foreach ($m in [regex]::Matches($Eta, '(\d+)([dhms])')) {
-        $n = [int]$m.Groups[1].Value
-        $t += switch ($m.Groups[2].Value) { 'd' { $n * 86400 } 'h' { $n * 3600 } 'm' { $n * 60 } default { $n } }
-    }
-    $t
-}
-
 function Get-UrlName([string] $Url) {             # the file name aria2 will most likely use
     if ($Url -like 'magnet:*') { return 'magnet link' }
     $u = ($Url -split '[?#]', 2)[0].TrimEnd('/')
     $name = $u.Substring($u.LastIndexOf('/') + 1)
-    if ($u -match '^[a-z]+://[^/]+/.' -and $name) { try { [Uri]::UnescapeDataString($name) } catch { $name } }
-    else { $u -replace '^[a-z]+://', '' }
+    $r = if ($u -match '^[a-z]+://[^/]+/.' -and $name) { try { [Uri]::UnescapeDataString($name) } catch { $name } }
+         else { $u -replace '^[a-z]+://', '' }
+    $r -replace '\p{Cc}', '?'                      # a crafted URL must not inject terminal escape sequences
 }
 function Get-UrlScheme([string] $Url) { ($Url -split ':', 2)[0].ToUpperInvariant() }
 
@@ -408,21 +400,53 @@ function Write-Live([int] $Pct, [string] $Speed, [string] $Eta, [int] $Active, [
     [Console]::Write("`r$ESC[2K$l1`n$ESC[2K$l2$ESC[1A`r")
 }
 
-# One aria2 readout line:  [#gid 4.5MiB/5.7MiB(80%) CN:1 DL:1.5MiB ETA:3s]   or   [DL:1.4MiB][#gid ...(16%)][#gid ...(35%)]
-function Update-Readout([string] $Line) {
-    if (-not $script:Tty) { return }
-    $speed = '--'; $eta = '--:--'; $pct = -1; $sum = 0
-    if ($Line -match 'DL:([\d.]+[KMGT]?i?B)') { $speed = ConvertTo-SpeedLabel $Matches[1] }
-    $pcts = @([regex]::Matches($Line, '\((\d+)%\)') | ForEach-Object { [int]$_.Groups[1].Value })
-    foreach ($p in $pcts) { $sum += $p }
-    $active = [Math]::Max(1, @($Line.ToCharArray() | Where-Object { $_ -eq '#' }).Count)
-    if ($pcts.Count -gt 0) { $pct = [int][Math]::Floor($sum / $pcts.Count) }
-    $opct = [Math]::Min(100, [int][Math]::Floor(($script:Finished * 100 + $sum) / $script:Total))
+# aria2's own console readout is block-buffered on a pipe (so it arrives in bursts) and is capped at once per second.
+# Instead the script asks aria2's local JSON-RPC server for the numbers every TickMs.
+function Invoke-Rpc([string] $Method, [string] $ParamsJson = '') {      # -> $true, result in $script:RpcResult
+    try {
+        $body = '{"jsonrpc":"2.0","id":"d","method":"' + $Method + '","params":["token:' + $script:RpcSecret + '"' + $ParamsJson + ']}'
+        $content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
+        $text = $script:Http.PostAsync($script:RpcUrl, $content).GetAwaiter().GetResult().Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $script:RpcResult = ($text | ConvertFrom-Json).result
+        $true
+    } catch { $false }
+}
+
+# Stops aria2 once its queue is empty (with RPC enabled it would keep running): save the session, then end the process.
+function Stop-Aria2 {
+    $script:Halted = $true
+    [void](Invoke-Rpc 'aria2.saveSession')
+    try { $script:Aria2Proc.Kill() } catch { }
+}
+
+# One look at aria2: redraw the live lines, and halt it once nothing is active or waiting (one idle look is enough when
+# every URL has reported back, otherwise two in a row).
+function Update-Progress {
+    $pct = -1; $speed = '--'; $eta = '--:--'; $n = 0; $sum = 0; $known = 0; $left = 0; $bps = 0
     $elapsed = [long]$script:StartedAt.Elapsed.TotalSeconds
-    if (($Jobs -eq 1 -or $active -eq 1) -and $Line -match 'ETA:([0-9dhms]+)') { $eta = Format-Time (ConvertTo-Seconds $Matches[1]) }
+    if (Invoke-Rpc 'aria2.tellActive' ',["completedLength","totalLength"]') {
+        $act = @($script:RpcResult); $n = $act.Count
+        foreach ($d in $act) {
+            $t = [long]$d.totalLength
+            if ($t -gt 0) { $c = [long]$d.completedLength; $sum += [int][Math]::Floor(100.0 * $c / $t); $known++; $left += $t - $c }
+        }
+        if (Invoke-Rpc 'aria2.getGlobalStat') {
+            $st = $script:RpcResult; $bps = [long]$st.downloadSpeed
+            if (-not $script:Halted) {
+                if ([int]$st.numActive -eq 0 -and [int]$st.numWaiting -eq 0) { $script:IdleTicks++ } else { $script:IdleTicks = 0 }
+                $need = if ($script:Finished -ge $script:Total) { 1 } else { 2 }
+                if ($script:IdleTicks -ge $need) { Stop-Aria2 }
+            }
+        }
+        if ($n -gt 0) { $speed = "$(Format-Bytes $bps)/s" }
+        if ($known -gt 0) { $pct = [int][Math]::Floor($sum / $known) }
+    }
+    if (-not $script:Tty) { return }
+    $opct = [Math]::Min(100, [int][Math]::Floor(($script:Finished * 100 + $sum) / $script:Total))
+    if (($Jobs -eq 1 -or $n -le 1) -and $bps -gt 0 -and $known -gt 0) { $eta = Format-Time ([long]($left / $bps)) }
     elseif ($opct -gt 0 -and $opct -lt 100 -and $elapsed -gt 0) { $eta = Format-Time ([long]($elapsed * (100 - $opct) / $opct)) }
     $script:Frame++
-    Write-Live $pct $speed $eta $active $opct
+    Write-Live $pct $speed $eta ([Math]::Max(1, $n)) $opct
 }
 
 function Write-ReportOk([string] $Tag, [string] $Name, [long] $Bytes, [long] $Secs) {
@@ -454,17 +478,17 @@ function Get-FriendlyReason([string] $Msg) { if ($Msg -match 'status=(\d+)') { "
 function Complete-Failure {
     $name = Get-UrlName $script:ExcUri
     $script:ExcPending = $false; $script:Finished++
+    $script:LastEvent = [long]$script:StartedAt.Elapsed.TotalSeconds
     Clear-Live
     $tag = "[$($script:Finished)/$($script:Total)]"
     if ($script:ExcCode -eq 13) { $script:Skipped++; Write-ReportNote 'skip' $tag $name 'already exists – use -f to replace' }
     else { $script:Fail++; Write-ReportNote 'fail' $tag $name "failed: $(Get-FriendlyReason $script:ExcMsg)" }
 }
 
-# Reads one line of aria2's output and turns it into the neat UI.
+# Reads one line of aria2's log and turns it into the neat UI. (Progress comes from Update-Progress, not from the log.)
 function Read-Aria2Line([string] $Line) {
     if ($script:ExcPending -and $Line -notmatch '^(Exception:|  ->)') { Complete-Failure }
-    if ($Line -match '^\[(#|DL:)') { Update-Readout $Line }
-    elseif ($Line -match '\[NOTICE\] Download complete: (.+)$') { Complete-Download $Matches[1].Trim() }
+    if ($Line -match '\[NOTICE\] Download complete: (.+)$') { Complete-Download $Matches[1].Trim() }
     elseif ($Line -match '\[ERROR\].*Download aborted\. URI=(.*)$') { $script:ExcPending = $true; $script:ExcUri = $Matches[1].Trim(); $script:ExcCode = 0; $script:ExcMsg = '' }
     elseif ($Line -match '^(Exception:|  ->)') {
         # the last errorCode/message pair on the last line wins
@@ -473,10 +497,16 @@ function Read-Aria2Line([string] $Line) {
 }
 
 function Invoke-Aria2 {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $listener.Start()
+    $port = $listener.LocalEndpoint.Port; $listener.Stop()
+    $script:RpcSecret = [guid]::NewGuid().ToString('N'); $script:RpcUrl = "http://127.0.0.1:$port/jsonrpc"
+    $handler = [Net.Http.SocketsHttpHandler]::new(); $handler.UseProxy = $false
+    $script:Http = [Net.Http.HttpClient]::new($handler); $script:Http.Timeout = [TimeSpan]::FromSeconds(2)
     $a = @("--input-file=$($script:InputPath)", "--dir=$OutputDir", "--max-concurrent-downloads=$Jobs",
-           "--split=$Connections", "--max-connection-per-server=$Connections", '--summary-interval=0',
+           "--split=$Connections", "--max-connection-per-server=$Connections", '--summary-interval=0', '--show-console-readout=false',
            '--console-log-level=notice', '--enable-color=false', '--download-result=hide', '--auto-file-renaming=false',
-           "--save-session=$($script:SessionPath)", '--save-session-interval=60')
+           "--save-session=$($script:SessionPath)", '--save-session-interval=60',
+           '--enable-rpc', "--rpc-listen-port=$port", "--rpc-secret=$($script:RpcSecret)", "--stop-with-process=$PID")
     if ($Force) { $a += '--allow-overwrite=true' }
     if ($Limit) { $a += "--max-overall-download-limit=$Limit" }
     $psi = [Diagnostics.ProcessStartInfo]::new($script:Aria2)
@@ -491,21 +521,40 @@ function Invoke-Aria2 {
     if ($script:Tty) { [Console]::Write("$ESC[?25l") }
     $finishedNormally = $false
     try {
-        while ($null -ne ($line = $proc.StandardOutput.ReadLine())) { Read-Aria2Line $line }
+        $read = $proc.StandardOutput.ReadLineAsync()
+        $tick = [Diagnostics.Stopwatch]::StartNew(); $lastLine = [Diagnostics.Stopwatch]::StartNew()
+        Update-Progress                                   # first frame right away, not after aria2 warms up
+        while ($true) {
+            if ($read.Wait([Math]::Max(1, $script:TickMs - [int]$tick.ElapsedMilliseconds))) {
+                $line = $read.Result
+                if ($null -eq $line) { break }            # aria2 has exited and its output is drained
+                Read-Aria2Line $line
+                $lastLine.Restart(); $read = $proc.StandardOutput.ReadLineAsync()
+                if ($script:Finished -ge $script:Total) { Update-Progress }
+            } elseif ($script:ExcPending -and $lastLine.ElapsedMilliseconds -gt 200) { Complete-Failure }   # failure report is complete
+            if ($tick.ElapsedMilliseconds -ge $script:TickMs) { $tick.Restart(); Update-Progress }
+        }
         if ($script:ExcPending) { Complete-Failure }
         $proc.WaitForExit()
-        $script:AriaRc = $proc.ExitCode
+        $script:AriaRc = if ($script:Halted) { 0 } else { $proc.ExitCode }
         $finishedNormally = $true
     } finally {
-        # Ctrl-C reaches aria2 too; give it a moment to shut down and write its session file before reporting.
+        # Ctrl-C reaches aria2 too; wake it so it shuts down at once and writes its session file before reporting.
         if (-not $finishedNormally) {
-            [void]$proc.WaitForExit(8000)
+            if (-not $proc.HasExited) {
+                try { [void]$script:Http.GetAsync("http://127.0.0.1:$port/").GetAwaiter().GetResult() } catch { }
+                if (-not $proc.WaitForExit(3000)) { Stop-Aria2 }
+                [void]$proc.WaitForExit(2000)
+            }
             $left = (Get-ItemCount $script:SessionPath) - $script:Skipped
             [Console]::Write("`r$ESC[2K`n$ESC[2K$ESC[1A`r$ESC[?25h`n  $($script:C.Warn)$($script:G.Warn) Interrupted$($script:C.Reset)`n")
             if ($left -gt 0) { [Console]::Write("  $($script:C.Muted)$left unfinished URL(s) saved $($script:G.Arrow) continue with: $(Get-ResumeCommand)$($script:C.Reset)`n") }
             [Console]::Write("`n")
             if ($script:InputPath) { Remove-Item -LiteralPath $script:InputPath -Force -ErrorAction SilentlyContinue }
+            $script:Http.Dispose()
+            [Environment]::Exit(130)                      # Ctrl-C used to end with 0 or 1 at random; the help promises 130
         } elseif ($script:Tty) { Clear-Live; [Console]::Write("$ESC[?25h") }
+        $script:Http.Dispose()
     }
 }
 
@@ -619,6 +668,11 @@ function Invoke-Dneat {
     if ($Limit) {
         if ($Limit -notmatch '^\d+(\.\d+)?[KkMm]?$') { Stop-Dneat "Invalid speed limit '$Limit'." @('Use a number with an optional K or M, e.g. 500K or 2M.') }
         $script:Limit = $Limit.ToUpperInvariant()
+        if ($Limit.Contains('.')) {      # aria2 only takes whole numbers: 1.5M -> 1536K
+            $null = $Limit -match '^(\d+(?:\.\d+)?)([KM]?)$'
+            $mult = switch ($Matches[2]) { 'M' { 1024 } 'K' { 1 } default { 1 / 1024 } }
+            $script:Limit = '{0}K' -f [Math]::Max(1, [int][Math]::Floor([double]$Matches[1] * $mult))
+        }
     }
 
     if ($InstallDeps) {
@@ -650,6 +704,7 @@ function Invoke-Dneat {
     # ── run ──
     $script:Finished = 0; $script:Ok = 0; $script:Fail = 0; $script:Skipped = 0; $script:TotalBytes = 0; $script:Frame = 0
     $script:ExcPending = $false; $script:ExcUri = ''; $script:ExcCode = 0; $script:ExcMsg = ''; $script:AriaRc = 0; $script:Remaining = 0
+    $script:IdleTicks = 0; $script:Halted = $false; $script:RpcResult = $null
     try { Invoke-Aria2 } finally { if ($script:InputPath) { Remove-Item -LiteralPath $script:InputPath -Force -ErrorAction SilentlyContinue } }
     if ($script:AriaRc -ne 0 -and $script:AriaRc -ne 13 -and $script:Fail -eq 0 -and $script:Skipped -eq 0 -and $script:Ok -lt $script:Total) {
         $script:Fail = 1; Write-Warn "aria2 stopped with exit code $($script:AriaRc)."
