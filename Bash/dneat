@@ -4,13 +4,14 @@
 # Missing prerequisites (aria2, a clipboard helper) are installed with your package manager only when needed.
 
 set -euo pipefail
-shopt -s lastpipe   # the aria2 output parser runs in this shell, so its counters survive the pipe
+(( BASH_VERSINFO[0] > 4 || BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4 )) || { echo "dneat needs bash 4.4 or newer." >&2; exit 1; }
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly DEFAULT_JOBS=1
 readonly DEFAULT_CONNECTIONS=16
 readonly DEFAULT_SESSION="resume.session"
-readonly URL_RE='(https?|ftps?)://[^[:space:]]+'          # what is picked out of clipboard text
+readonly URL_RE='((https?|ftps?|sftp)://|magnet:\?)[^[:space:]]+'   # what is picked out of clipboard text
+readonly TICK_US=500000                                   # live progress refresh interval (µs)
 readonly ITEM_RE='^(https?|ftps?|sftp)://|^magnet:'       # a URL line in an aria2 input file (options are indented)
 
 output_dir="" jobs=$DEFAULT_JOBS connections=$DEFAULT_CONNECTIONS limit="" session_file=$DEFAULT_SESSION
@@ -18,7 +19,8 @@ force=0 keep_list=0 allow_install=1 install_deps=0
 sources=() LIST_FILES=() URLS=() ARIA_ARGS=() NORM=()
 PM="" PM_LOG="" NETWORK_STATE="" INPUT_FILE="" source_label="" aria_rc=0 aria_running=0 interrupted=0
 total_items=0 finished=0 ok=0 fail=0 skipped=0 total_bytes=0 NAME_COL=24 frame=0 remaining=0
-exc_pending=0 exc_uri="" exc_code=0 exc_msg="" last_event=0
+exc_pending=0 exc_uri="" exc_code=0 exc_msg="" last_event=0 last_line_us=0 tick_us=0
+idle_ticks=0 stopping=0 rpc_port=0 rpc_secret="" aria_pid="" ACT_DONE=() ACT_TOTAL=() ACT_SPEED=()
 started_at=$SECONDS
 
 # ══ UI layer ══════════════════════════════════════════════════════════════════
@@ -93,32 +95,26 @@ human_bytes() { # <bytes>
     if (( unit == 0 )); then printf '%d B' "$1"; else printf '%d.%d %s' $(( tenths / 10 )) $(( tenths % 10 )) "${units[unit]}"; fi
 }
 
-# aria2 prints sizes as 1.4MiB / 512KiB / 0B; the UI uses the same KB/MB style as vneat and pneat.
-speed_label() { # <aria2 size> → "1.4 MB/s"
-    if [[ $1 =~ ^([0-9.]+)([KMGT]?)i?B$ ]]; then printf '%s %sB/s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; else printf '%s/s' "$1"; fi
-}
+now_us() { if [[ -n ${EPOCHREALTIME:-} ]]; then REPLY=${EPOCHREALTIME/[.,]}; else REPLY=$(( SECONDS * 1000000 )); fi; }
 
-eta_seconds() { # <aria2 eta, e.g. 1h2m3s> → seconds
-    local rest=$1 total=0
-    while [[ $rest =~ ^([0-9]+)([dhms])(.*)$ ]]; do
-        case ${BASH_REMATCH[2]} in
-            d) total=$(( total + 10#${BASH_REMATCH[1]} * 86400 )) ;;
-            h) total=$(( total + 10#${BASH_REMATCH[1]} * 3600 )) ;;
-            m) total=$(( total + 10#${BASH_REMATCH[1]} * 60 )) ;;
-            s) total=$(( total + 10#${BASH_REMATCH[1]} )) ;;
-        esac
-        rest=${BASH_REMATCH[3]}
+# Decodes %XX only where XX is hex (a literal % or \ stays as it is) and shows control characters as "?",
+# so a crafted URL cannot inject terminal escape sequences. No subshell: the result is in REPLY.
+url_decode() { # <text> → REPLY
+    local s=$1 out="" ch
+    while [[ $s =~ ^([^%]*)%([0-9A-Fa-f]{2})(.*)$ ]]; do
+        printf -v ch "\\x${BASH_REMATCH[2]}"
+        out+=${BASH_REMATCH[1]}$ch
+        s=${BASH_REMATCH[3]}
     done
-    printf '%d' "$total"
+    out+=$s
+    REPLY=${out//[[:cntrl:]]/?}
 }
 
-url_decode() { local s=$1; printf '%b' "${s//%/\\x}"; }
-
-url_name() { # <url> → the file name aria2 will most likely use
+url_name() { # <url> → REPLY: the file name aria2 will most likely use
+    if [[ $1 == magnet:* ]]; then REPLY="magnet link"; return 0; fi
     local u=${1%%[?#]*} name
-    if [[ $1 == magnet:* ]]; then printf 'magnet link'; return 0; fi
     u=${u%/}; name=${u##*/}
-    if [[ $u == *://*/* && -n $name ]]; then url_decode "$name"; else printf '%s' "${u#*://}"; fi
+    if [[ $u == *://*/* && -n $name ]]; then url_decode "$name"; else url_decode "${u#*://}"; fi
 }
 
 url_scheme() { local s=${1%%:*}; printf '%s' "${s^^}"; }
@@ -235,12 +231,13 @@ print_plan() {
 
 cleanup() {
     show_cursor
+    [[ -z $aria_pid ]] || kill "$aria_pid" 2>/dev/null || true
     [[ -z $INPUT_FILE ]] || rm -f "$INPUT_FILE"
     [[ -z $PM_LOG ]] || rm -f "$PM_LOG"
 }
 
-# While aria2 runs, Ctrl-C only sets a flag: aria2 receives the same signal, shuts down gracefully (writing its
-# session file) and closes the pipe, which ends the parser loop. Anywhere else the script stops right away.
+# While aria2 runs, Ctrl-C / TERM / HUP only set a flag and ask aria2 to shut down gracefully (it writes its session
+# file and closes its output, which ends the main loop). Anywhere else the script stops right away.
 report_interrupted() {
     clear_live
     show_cursor
@@ -250,18 +247,9 @@ report_interrupted() {
     printf '\n'
     exit 130
 }
-on_interrupt() { if (( aria_running )); then interrupted=1; else report_interrupted; fi; }
-on_terminate() {
-    if (( aria_running )); then
-        interrupted=1
-        pkill -INT -f -- "--input-file=$INPUT_FILE" 2>/dev/null || true     # a plain kill never reaches aria2
-    else
-        report_interrupted
-    fi
-}
+stop_aria2() { if (( aria_running )); then interrupted=1; halt_aria2; else report_interrupted; fi; }
 trap cleanup EXIT
-trap on_interrupt INT
-trap on_terminate TERM
+trap stop_aria2 INT TERM HUP
 
 # ══ Help ══════════════════════════════════════════════════════════════════════
 help_opt() { # <flags> <description> [default]
@@ -341,7 +329,9 @@ normalize_args() {
         case $arg in
             --)    NORM+=(-- "$@"); break ;;
             --*=*) name=${arg%%=*}; name=${name#--}
-                   [[ -n ${LONG_VALUE[$name]:-} ]] || die "Option --$name does not take a value." "Run 'dneat --help' to see all options."
+                   if [[ -z ${LONG_VALUE[$name]:-} ]]; then
+                       [[ -n ${LONG_FLAG[$name]:-} ]] && die "Option --$name does not take a value." || die "Unknown option '--$name'." "Run 'dneat --help' to see all options."
+                   fi
                    NORM+=("-${LONG_VALUE[$name]}" "${arg#*=}") ;;
             --*)   name=${arg#--}
                    if [[ -n ${LONG_VALUE[$name]:-} ]]; then
@@ -388,6 +378,7 @@ parse_args() {
     validate_count "$connections" || die "Connections must be a number from 1 to 16."
     jobs=$(( 10#$jobs )); connections=$(( 10#$connections ))
     if [[ -n $limit ]]; then validate_limit "$limit" || die "Invalid speed limit '$limit'." "Use a number with an optional K or M, e.g. 500K or 2M."; fi
+    if [[ $limit == *.* ]]; then limit=$(awk -v v="${limit%[KM]}" -v u="${limit: -1}" 'BEGIN { k = v * (u == "M" ? 1024 : u == "K" ? 1 : 1 / 1024); printf "%dK", k < 1 ? 1 : k }'); fi   # 1.5M → 1536K
 }
 
 require_linux() {
@@ -596,8 +587,8 @@ warn_stale_session() {
 }
 
 compute_layout() {
-    local u longest=0 name
-    for u in "${URLS[@]}"; do name=$(url_name "$u"); if (( ${#name} > longest )); then longest=${#name}; fi; done
+    local u longest=0
+    for u in "${URLS[@]}"; do url_name "$u"; if (( ${#REPLY} > longest )); then longest=${#REPLY}; fi; done
     NAME_COL=$(( UI_COLS - 60 ))
     if (( NAME_COL < 14 )); then NAME_COL=14; fi
     if (( NAME_COL > 40 )); then NAME_COL=40; fi
@@ -617,17 +608,17 @@ draw_live() { # <pct|-1> <speed> <eta> <active> <overall pct>
     if (( jobs == 1 )); then
         if (( idx > total_items )); then idx=$total_items; fi
         tag="[$idx/$total_items]"
-        name=$(url_name "${URLS[idx-1]:-}"); label=$(url_scheme "${URLS[idx-1]:-?}")
+        url_name "${URLS[idx-1]:-}"; name=$REPLY; label=$(url_scheme "${URLS[idx-1]:-?}")
     else
         tag="[$finished/$total_items]"
         name="$active active"; label="$G_TIMES$active"
     fi
     badge_w=$(( ${#label} + 2 ))
     if (( pct >= 0 )); then
-        plain=$(printf '%3d%%  %9s  ETA %-5s' "$pct" "$speed" "$eta")
-        colored=$(printf '%s%3d%%%s  %s%9s  ETA %-5s%s' "$C_BOLD" "$pct" "$C_RESET" "$C_MUTED" "$speed" "$eta" "$C_RESET")
+        printf -v plain '%3d%%  %9s  ETA %-5s' "$pct" "$speed" "$eta"
+        printf -v colored '%s%3d%%%s  %s%9s  ETA %-5s%s' "$C_BOLD" "$pct" "$C_RESET" "$C_MUTED" "$speed" "$eta" "$C_RESET"
     else
-        plain=$(printf '%7s  %9s' "$(fmt_time $(( SECONDS - started_at )))" "$speed")
+        printf -v plain '%7s  %9s' "$(fmt_time $(( SECONDS - started_at )))" "$speed"
         colored="$C_MUTED$plain$C_RESET"
     fi
     avail=$(( UI_COLS - (2 + 1 + 1 + ${#tag} + 1 + 1 + ${#plain} + 2 + badge_w) - 1 ))   # room for the name and the bar
@@ -640,35 +631,56 @@ draw_live() { # <pct|-1> <speed> <eta> <active> <overall pct>
     prefix_w=$(( 2 + 1 + 1 + ${#tag} + 1 + name_max + 1 ))
     if (( bw > 0 )); then obw=$bw; else obw=$(( UI_COLS - prefix_w - 24 )); if (( obw > BAR_W )); then obw=$BAR_W; fi; if (( obw < 6 )); then obw=6; fi; fi
     spin=${G_SPIN[frame % ${#G_SPIN[@]}]}
-    l1=$(printf '  %s%s%s %s%s%s %s%s%s %s%s  %s' "$C_ACC" "$spin" "$C_RESET" "$C_MUTED" "$tag" "$C_RESET" \
-        "$C_BOLD" "$(pad "$name" "$name_max")" "$C_RESET" "$bar" "$colored" "$(badge "$label")")
-    l2=$(printf '%s%*s%s %s  %s%3d%%  %s elapsed%s' "$C_MUTED" $(( prefix_w - 1 )) "overall" "$C_RESET" \
-        "$(make_bar "$opct" "$obw")" "$C_MUTED" "$opct" "$(fmt_time $(( SECONDS - started_at )))" "$C_RESET")
+    printf -v l1 '  %s%s%s %s%s%s %s%s%s %s%s  %s' "$C_ACC" "$spin" "$C_RESET" "$C_MUTED" "$tag" "$C_RESET" \
+        "$C_BOLD" "$(pad "$name" "$name_max")" "$C_RESET" "$bar" "$colored" "$(badge "$label")"
+    printf -v l2 '%s%*s%s %s  %s%3d%%  %s elapsed%s' "$C_MUTED" $(( prefix_w - 1 )) "overall" "$C_RESET" \
+        "$(make_bar "$opct" "$obw")" "$C_MUTED" "$opct" "$(fmt_time $(( SECONDS - started_at )))" "$C_RESET"
     printf '\r\e[2K%s\n\e[2K%s\e[1A\r' "$l1" "$l2"
 }
 
-# One aria2 readout line:  [#gid 4.5MiB/5.7MiB(80%) CN:1 DL:1.5MiB ETA:3s]   or   [DL:1.4MiB][#gid …(16%)][#gid …(35%)]
-handle_readout() { # <line>
+# aria2's own console readout is block-buffered on a pipe (so it arrives in bursts) and is capped at once per second.
+# Instead the script asks aria2's local JSON-RPC server for the numbers every TICK_US, over bash's /dev/tcp (no forks).
+rpc() { # <method> [params-json] → REPLY = response body; fails quietly while aria2 is still starting
+    local body fd
+    printf -v body '{"jsonrpc":"2.0","id":"d","method":"%s","params":["token:%s"%s]}' "$1" "$rpc_secret" "${2:+,$2}"
+    { exec {fd}<>"/dev/tcp/127.0.0.1/$rpc_port"; } 2>/dev/null || return 1
+    printf 'POST /jsonrpc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+        "${#body}" "$body" >&"$fd" 2>/dev/null || { exec {fd}>&-; return 1; }
+    IFS= read -r -d '' -t 2 -u "$fd" REPLY || true
+    exec {fd}>&-
+    REPLY=${REPLY#*$'\r\n\r\n'}
+}
+
+scan_json() { # <key> <array> : every "key":"<number>" in $REPLY, in order
+    local -n out=$2; local s=$REPLY re="\"$1\":\"([0-9]+)\""
+    out=()
+    while [[ $s =~ $re ]]; do out+=("${BASH_REMATCH[1]}"); s=${s#*"${BASH_REMATCH[0]}"}; done
+}
+
+poll_progress() {
     (( UI_TTY )) || return 0
-    local line=$1 rest=$1 sum=0 n=0 pct=-1 speed="--" eta="--:--" marks active opct elapsed
-    if [[ $line =~ DL:([0-9.]+[KMGT]?i?B) ]]; then speed=$(speed_label "${BASH_REMATCH[1]}"); fi
-    while [[ $rest =~ \(([0-9]+)%\) ]]; do
-        sum=$(( sum + 10#${BASH_REMATCH[1]} )); n=$(( n + 1 ))
-        rest=${rest#*"${BASH_REMATCH[0]}"}
-    done
-    marks=${line//[^#]/}; active=${#marks}
-    if (( active < 1 )); then active=1; fi
-    if (( n > 0 )); then pct=$(( sum / n )); fi
-    opct=$(( (finished * 100 + (n > 0 ? sum : 0)) / total_items ))
+    local pct=-1 speed="--" eta="--:--" i n=0 sum=0 known=0 bps=0 left=0 opct elapsed=$(( SECONDS - started_at ))
+    if rpc aria2.tellActive '["completedLength","totalLength","downloadSpeed"]'; then
+        scan_json completedLength ACT_DONE; scan_json totalLength ACT_TOTAL; scan_json downloadSpeed ACT_SPEED
+        n=${#ACT_DONE[@]}
+        for (( i = 0; i < n; i++ )); do
+            bps=$(( bps + ACT_SPEED[i] ))
+            if (( ACT_TOTAL[i] > 0 )); then
+                sum=$(( sum + 100 * ACT_DONE[i] / ACT_TOTAL[i] )); known=$(( known + 1 )); left=$(( left + ACT_TOTAL[i] - ACT_DONE[i] ))
+            fi
+        done
+        if (( n > 0 )); then speed="$(human_bytes "$bps")/s"; fi
+        if (( known > 0 )); then pct=$(( sum / known )); fi
+    fi
+    opct=$(( (finished * 100 + sum) / total_items ))
     if (( opct > 100 )); then opct=100; fi
-    elapsed=$(( SECONDS - started_at ))
-    if (( jobs == 1 || active == 1 )) && [[ $line =~ ETA:([0-9dhms]+) ]]; then
-        eta=$(fmt_time "$(eta_seconds "${BASH_REMATCH[1]}")")
+    if (( (jobs == 1 || n <= 1) && bps > 0 && known > 0 )); then
+        eta=$(fmt_time $(( left / bps )))
     elif (( opct > 0 && opct < 100 && elapsed > 0 )); then
         eta=$(fmt_time $(( elapsed * (100 - opct) / opct )))
     fi
     frame=$(( frame + 1 ))
-    draw_live "$pct" "$speed" "$eta" "$active" "$opct"
+    draw_live "$pct" "$speed" "$eta" "$(( n < 1 ? 1 : n ))" "$opct"
 }
 
 report_ok() { # <tag> <name> <bytes> <seconds|-1>
@@ -712,8 +724,8 @@ friendly_reason() { # <message>
 }
 
 flush_failure() {
-    local name; name=$(url_name "$exc_uri")
-    exc_pending=0
+    url_name "$exc_uri"; local name=$REPLY
+    exc_pending=0 last_event=$SECONDS
     finished=$(( finished + 1 ))
     clear_live
     if (( exc_code == 13 )); then
@@ -723,36 +735,94 @@ flush_failure() {
     fi
 }
 
-# Reads aria2's merged output line by line and turns it into the neat UI.
-parse_stream() {
-    local line
-    while IFS= read -r line; do
-        if (( exc_pending )) && [[ $line != Exception:* && $line != '  ->'* ]]; then flush_failure; fi
-        case $line in
-            '[#'*|'[DL:'*)                       handle_readout "$line" ;;
-            *'[NOTICE] Download complete: '*)    handle_complete "${line##*Download complete: }" ;;
-            *'[ERROR] '*'Download aborted. URI='*) exc_pending=1; exc_uri=${line##*URI=}; exc_code=0; exc_msg="" ;;
-            Exception:*|'  ->'*)                 parse_exception "$line" ;;
-            '@@EXIT '*)                          aria_rc=${line#@@EXIT } ;;
-        esac
+# One aria2 log line → the neat UI. (Progress comes from poll_progress, not from the log.)
+handle_event() { # <line>
+    if (( exc_pending )) && [[ $1 != Exception:* && $1 != '  ->'* ]]; then flush_failure; fi
+    case $1 in
+        *'[NOTICE] Download complete: '*)    handle_complete "${1##*Download complete: }" ;;
+        *'[ERROR] '*'Download aborted. URI='*) exc_pending=1; exc_uri=${1##*URI=}; exc_code=0; exc_msg="" ;;
+        Exception:*|'  ->'*)                 parse_exception "$1" ;;
+    esac
+}
+
+# aria2 only wakes up once a second to look at signals, so after SIGINT a throwaway connection to its RPC port wakes it
+# immediately (graceful: unfinished work and the session file are saved, exit takes milliseconds).
+halt_aria2() {
+    stopping=1
+    kill -INT "$aria_pid" 2>/dev/null || true
+    { exec 8<>"/dev/tcp/127.0.0.1/$rpc_port"; } 2>/dev/null && exec 8>&-
+    return 0
+}
+
+# With RPC enabled aria2 keeps running after its queue is empty, so halt it once nothing is active or waiting
+# (one look is enough when every URL has reported back, otherwise two ticks in a row).
+shutdown_when_idle() {
+    (( stopping )) && return 0
+    local -a active=() waiting=()
+    local need=2
+    rpc aria2.getGlobalStat || return 0
+    scan_json numActive active; scan_json numWaiting waiting
+    if (( ${#active[@]} == 1 && ${#waiting[@]} == 1 )) && (( active[0] + waiting[0] == 0 )); then idle_ticks=$(( idle_ticks + 1 )); else idle_ticks=0; fi
+    if (( finished >= total_items )); then need=1; fi
+    if (( idle_ticks >= need )); then halt_aria2; fi
+    return 0
+}
+
+free_port() { # → REPLY: a loopback port nobody listens on
+    local p
+    for p in $(shuf -i 49152-65535 -n 20); do
+        if ! { exec 9<>"/dev/tcp/127.0.0.1/$p"; } 2>/dev/null; then REPLY=$p; return 0; fi
+        exec 9>&-
     done
-    if (( exc_pending )); then flush_failure; fi
+    return 1
 }
 
 run_aria2() {
+    local line buf="" t left rc=0 fd launch=()
+    free_port || die "No free local port for aria2's progress channel."
+    rpc_port=$REPLY; rpc_secret=$(</proc/sys/kernel/random/uuid)
     ARIA_ARGS=(--input-file="$INPUT_FILE" --dir="$output_dir"
         --max-concurrent-downloads="$jobs" --split="$connections" --max-connection-per-server="$connections"
-        --summary-interval=0 --console-log-level=notice --enable-color=false --download-result=hide
-        --auto-file-renaming=false --save-session="$session_file" --save-session-interval=60)
+        --summary-interval=0 --show-console-readout=false --console-log-level=notice --enable-color=false --download-result=hide
+        --auto-file-renaming=false --save-session="$session_file" --save-session-interval=60
+        --enable-rpc --rpc-listen-port="$rpc_port" --rpc-secret="$rpc_secret" --stop-with-process=$$)
     if (( force )); then ARIA_ARGS+=(--allow-overwrite=true); fi
     if [[ -n $limit ]]; then ARIA_ARGS+=(--max-overall-download-limit="$limit"); fi
+    if command -v setsid &>/dev/null; then launch+=(setsid); fi             # own session: a terminal Ctrl-C reaches only us, and we halt aria2 once
+    if command -v stdbuf &>/dev/null; then launch+=(stdbuf -oL -eL); fi    # without it aria2 buffers its log lines too
     last_event=$SECONDS
     hide_cursor
     aria_running=1
-    {
-        aria2c "${ARIA_ARGS[@]}" 2>&1 && rc=0 || rc=$?
-        printf '@@EXIT %d\n' "$rc"
-    } | parse_stream
+    trap '' PIPE                                                            # a dead aria2 must not kill us mid-write
+    set +e   # Ctrl-C also reaches the short-lived $(...) subshells of the live UI and kills them; that must not abort the script
+    coproc ARIA { exec "${launch[@]}" aria2c "${ARIA_ARGS[@]}" 2>&1; }
+    aria_pid=$ARIA_PID
+    exec {fd}<&"${ARIA[0]}"      # bash closes ARIA[0] and unsets ARIA / ARIA_PID as soon as aria2 exits; a copy keeps the unread tail
+    poll_progress                                                           # first frame right away, not after aria2 warms up
+    now_us; tick_us=$REPLY; last_line_us=$REPLY
+    while :; do
+        now_us; left=$(( tick_us + TICK_US - REPLY ))
+        if (( left < 1000 )); then left=1000; fi
+        printf -v t '0.%06d' "$left"
+        if IFS= read -r -t "$t" -u "$fd" line; then
+            handle_event "$buf$line"; buf=""; now_us; last_line_us=$REPLY
+            if (( finished >= total_items )); then shutdown_when_idle; fi
+        else
+            rc=$?
+            if (( rc <= 128 )); then break; fi                              # EOF: aria2 has exited
+            buf+=$line                                                      # timeout: keep a partial line, if any
+            now_us
+            if (( exc_pending && REPLY - last_line_us > 200000 )); then flush_failure; fi   # failure report is complete
+        fi
+        now_us
+        if (( REPLY - tick_us >= TICK_US )); then tick_us=$REPLY; poll_progress; shutdown_when_idle; fi
+    done
+    exec {fd}<&-
+    wait "$aria_pid" || aria_rc=$?
+    aria_pid=""
+    trap - PIPE
+    set -e
+    if (( exc_pending )); then flush_failure; fi
     aria_running=0
     clear_live
     show_cursor
